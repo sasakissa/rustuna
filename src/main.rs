@@ -1,16 +1,75 @@
 use anyhow::{anyhow, Result};
 use rand::{prelude::ThreadRng, Rng};
-use std::collections::HashMap;
+use std::{any::Any, collections::HashMap, marker::PhantomData};
 fn main() {
     let study = create_study(Storage::new(), Sampler::new());
     study.optimize(obj, 10);
 }
 fn obj(trial: &mut Trial) -> f64 {
-    let x = trial.suggest_uniform("x", 0.0, 10.0).unwrap();
-    let y = trial.suggest_uniform("y", 0.0, 10.0).unwrap();
-    return (x - 3_f64).powf(2.0) + (y - 5_f64).powf(2.0);
+    let x = trial.suggest_int("x", 0, 10).unwrap();
+    let y = trial.suggest_int("y", 0, 10).unwrap();
+    return (x as f64 - 3_f64).powf(2.0) + (y as f64 - 5_f64).powf(2.0);
 }
 
+trait Distribution<T> {
+    fn to_internal_repr(&self, external_repr: T) -> f64;
+    fn to_external_repr(&self, internal_repr: f64) -> T;
+}
+#[derive(Clone)]
+struct IntUniformDistribution {
+    low: i64,
+    high: i64,
+}
+impl IntUniformDistribution {
+    fn new(low: i64, high: i64) -> Self {
+        IntUniformDistribution { low, high }
+    }
+}
+impl Distribution<i64> for IntUniformDistribution {
+    fn to_internal_repr(&self, external_repr: i64) -> f64 {
+        return external_repr as f64;
+    }
+
+    fn to_external_repr(&self, internal_repr: f64) -> i64 {
+        return internal_repr as i64;
+    }
+}
+
+#[derive(Clone)]
+struct CategoricalDistribution {
+    choices: Vec<String>,
+}
+impl CategoricalDistribution {
+    fn new(choices: Vec<String>) -> Self {
+        CategoricalDistribution { choices }
+    }
+}
+
+impl Distribution<String> for CategoricalDistribution {
+    fn to_internal_repr(&self, external_repr: String) -> f64 {
+        return self
+            .choices
+            .iter()
+            .position(|choice| *choice == external_repr)
+            .unwrap_or(0) as f64;
+    }
+
+    fn to_external_repr(&self, internal_repr: f64) -> String {
+        return self.choices[internal_repr as usize].clone();
+    }
+}
+
+/// see https://www.simonewebdesign.it/rust-hashmap-insert-values-multiple-types/
+#[derive(Clone)]
+enum Distributions {
+    IntUniform(IntUniformDistribution),
+    Categorical(CategoricalDistribution),
+}
+
+enum ExternalRepr {
+    Int(i64),
+    Str(String),
+}
 #[derive(PartialEq, Clone, Copy)]
 enum FrozenTrialState {
     Running,
@@ -23,21 +82,18 @@ struct FrozenTrial {
     trial_id: usize,
     state: FrozenTrialState,
     value: f64,
-    params: HashMap<String, f64>,
+    internal_params: HashMap<String, f64>,
+    distributions: HashMap<String, Distributions>,
 }
 
 impl FrozenTrial {
-    fn new(
-        trial_id: usize,
-        state: FrozenTrialState,
-        value: f64,
-        params: HashMap<String, f64>,
-    ) -> Self {
+    fn new(trial_id: usize, state: FrozenTrialState, value: f64) -> Self {
         Self {
             trial_id,
             state,
             value,
-            params,
+            internal_params: HashMap::new(),
+            distributions: HashMap::new(),
         }
     }
 
@@ -46,6 +102,29 @@ impl FrozenTrial {
             FrozenTrialState::Running => false,
             _ => true,
         }
+    }
+
+    fn params(&mut self) -> HashMap<String, ExternalRepr> {
+        let mut external_repr: HashMap<String, ExternalRepr> = HashMap::new();
+        for param_name in self.internal_params.keys() {
+            let distribution = self.distributions.get_mut(param_name).unwrap();
+            let internal_repr = self.internal_params[param_name];
+            match distribution {
+                Distributions::IntUniform(dist) => {
+                    external_repr.insert(
+                        param_name.to_string(),
+                        ExternalRepr::Int(dist.to_external_repr(internal_repr)),
+                    );
+                }
+                Distributions::Categorical(dist) => {
+                    external_repr.insert(
+                        param_name.to_string(),
+                        ExternalRepr::Str(dist.to_external_repr(internal_repr)),
+                    );
+                }
+            };
+        }
+        return external_repr;
     }
 }
 
@@ -61,7 +140,7 @@ impl Storage {
     fn create_new_trial(&mut self) -> usize {
         let trial_id = self.trials.len();
         let params: HashMap<String, f64> = HashMap::new();
-        let trial = FrozenTrial::new(trial_id, FrozenTrialState::Running, 0_f64, params);
+        let trial = FrozenTrial::new(trial_id, FrozenTrialState::Running, 0_f64);
         self.trials.push(trial);
         return trial_id;
     }
@@ -133,7 +212,13 @@ impl Storage {
         return Ok(());
     }
 
-    fn set_trial_param(&mut self, trial_id: usize, name: &str, value: f64) -> Result<()> {
+    fn set_trial_param(
+        &mut self,
+        trial_id: usize,
+        name: &str,
+        distribution: Distributions,
+        value: f64,
+    ) -> Result<()> {
         let mut target_idx = -1;
         for i in 0..self.trials.len() {
             let trial = &self.trials[i];
@@ -149,8 +234,11 @@ impl Storage {
             return Err(anyhow!("Missing trial idx: {}", trial_id));
         }
         self.trials[target_idx as usize]
-            .params
+            .internal_params
             .insert(name.to_string(), value);
+        self.trials[target_idx as usize]
+            .distributions
+            .insert(name.to_string(), distribution);
         return Ok(());
     }
 }
@@ -168,13 +256,22 @@ impl Trial {
         };
     }
 
-    fn suggest_uniform(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
-        let param = self.study.sampler.sample_independent(low, high);
-
-        self.study
-            .storage
-            .set_trial_param(self.trial_id, name, param);
-        return Ok(param);
+    fn suggest_int(&mut self, name: &str, low: i64, high: i64) -> Result<i64> {
+        let trial = self.study.storage.get_trial(self.trial_id);
+        let distribution = IntUniformDistribution::new(low, high);
+        let distributionEnum = Distributions::IntUniform(IntUniformDistribution::new(low, high));
+        let param_value = self
+            .study
+            .sampler
+            .sample_independent_int(name, distributionEnum);
+        let param_value_in_internal_repr = distribution.to_internal_repr(param_value);
+        self.study.storage.set_trial_param(
+            self.trial_id,
+            name,
+            Distributions::IntUniform(distribution),
+            param_value_in_internal_repr,
+        );
+        return Ok(param_value);
     }
 }
 
@@ -189,9 +286,16 @@ impl Sampler {
             rng: rand::thread_rng(),
         }
     }
-    fn sample_independent(&mut self, low: f64, high: f64) -> f64 {
-        let n: f64 = self.rng.gen_range(low..=high);
-        n
+    fn sample_independent_int(&mut self, name: &str, distribution: Distributions) -> i64 {
+        match distribution {
+            Distributions::IntUniform(dist) => {
+                let n = self.rng.gen_range(dist.low..=dist.high);
+                return n;
+            }
+            _ => {
+                return 0;
+            }
+        }
     }
 }
 type Objective = fn(&mut Trial) -> f64;
